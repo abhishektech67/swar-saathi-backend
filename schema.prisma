@@ -1,0 +1,154 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  THERAPIST
+  CAREGIVER
+  PATIENT
+}
+
+enum ExerciseCategory {
+  ARTICULATION
+  FLUENCY
+  VOICE
+}
+
+enum CaregiverRelationship {
+  PARENT
+  GUARDIAN
+  SPOUSE
+  OTHER
+}
+
+model Organization {
+  id                  String               @id @default(uuid())
+  name                String
+  slug                String               @unique
+  country             String
+  users               User[]
+  patientProfiles     PatientProfile[]
+  exercises           Exercise[]
+  exerciseAssignments ExerciseAssignment[]
+  audioLogs           AudioLog[]
+  caregiverFeedbacks  CaregiverFeedback[]
+  createdAt           DateTime             @default(now())
+}
+
+model User {
+  id                 String               @id @default(uuid())
+  organizationId     String
+  organization       Organization         @relation(fields: [organizationId], references: [id])
+  email              String               @unique
+  fullName           String
+  passwordHash       String
+  role               Role
+  patientProfile     PatientProfile?
+  therapistPatients  PatientTherapist[]
+  caregiverPatients  PatientCaregiver[]
+  createdExercises   Exercise[]
+  assignedExercises  ExerciseAssignment[]
+  caregiverFeedbacks CaregiverFeedback[]
+  createdAt          DateTime             @default(now())
+}
+
+model PatientProfile {
+  id                     String               @id @default(uuid())
+  organizationId         String
+  organization           Organization         @relation(fields: [organizationId], references: [id])
+  userId                 String               @unique
+  user                   User                 @relation(fields: [userId], references: [id])
+  dateOfBirth            DateTime
+  primaryDiagnosis       String
+  clinicalNotes          String
+  currentDifficultyLevel Int                  @default(1)
+  therapists             PatientTherapist[]
+  caregivers             PatientCaregiver[]
+  exerciseAssignments    ExerciseAssignment[]
+  audioLogs              AudioLog[]
+  caregiverFeedbacks     CaregiverFeedback[]
+}
+
+model PatientTherapist {
+  id               String         @id @default(uuid())
+  patientProfileId String
+  patientProfile   PatientProfile @relation(fields: [patientProfileId], references: [id])
+  therapistId      String
+  therapist        User           @relation(fields: [therapistId], references: [id])
+  isPrimary        Boolean        @default(true)
+}
+
+model PatientCaregiver {
+  id               String                @id @default(uuid())
+  patientProfileId String
+  patientProfile   PatientProfile        @relation(fields: [patientProfileId], references: [id])
+  caregiverId      String
+  caregiver        User                  @relation(fields: [caregiverId], references: [id])
+  relationship     CaregiverRelationship
+}
+
+model Exercise {
+  id                  String               @id @default(uuid())
+  organizationId      String
+  organization        Organization         @relation(fields: [organizationId], references: [id])
+  createdById         String
+  createdBy           User                 @relation(fields: [createdById], references: [id])
+  title               String
+  description         String
+  category            ExerciseCategory
+  difficultyLevel     Int
+  targetPhonemes      String[]
+  instructions        String
+  gamePointsValue     Int                  @default(10)
+  exerciseAssignments ExerciseAssignment[]
+  audioLogs           AudioLog[]
+}
+
+model ExerciseAssignment {
+  id               String         @id @default(uuid())
+  organizationId   String
+  organization     Organization   @relation(fields: [organizationId], references: [id])
+  patientProfileId String
+  patientProfile   PatientProfile @relation(fields: [patientProfileId], references: [id])
+  exerciseId       String
+  exercise         Exercise       @relation(fields: [exerciseId], references: [id])
+  assignedById     String
+  assignedBy       User           @relation(fields: [assignedById], references: [id])
+  isCompleted      Boolean        @default(false)
+  dueDate          DateTime
+}
+
+model AudioLog {
+  id                  String         @id @default(uuid())
+  organizationId      String
+  organization        Organization   @relation(fields: [organizationId], references: [id])
+  patientProfileId    String
+  patientProfile      PatientProfile @relation(fields: [patientProfileId], references: [id])
+  exerciseId          String
+  exercise            Exercise       @relation(fields: [exerciseId], references: [id])
+  s3Url               String
+  durationSeconds     Float
+  pitchMeanHz         Float
+  clarityScore        Float
+  pronunciationScore Float
+  difficultyAtAttempt Int
+  recordedAt          DateTime       @default(now())
+}
+
+model CaregiverFeedback {
+  id               String         @id @default(uuid())
+  organizationId   String
+  organization     Organization   @relation(fields: [organizationId], references: [id])
+  patientProfileId String
+  patientProfile   PatientProfile @relation(fields: [patientProfileId], references: [id])
+  caregiverId      String
+  caregiver        User           @relation(fields: [caregiverId], references: [id])
+  feedbackText     String
+  moodRating       Int
+  createdAt        DateTime       @default(now())
+}
