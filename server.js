@@ -8,7 +8,51 @@ const jwt = require("jsonwebtoken");
 const app = express();
 const prisma = new PrismaClient();
 
-const JWT_SECRET = "speech-db-secret-key";
+// =========================
+// CONFIGURATION
+// =========================
+
+const PORT = process.env.PORT || 3000;
+
+// For production, set JWT_SECRET in Render Environment Variables.
+// The fallback keeps your current local setup working.
+const JWT_SECRET =
+  process.env.JWT_SECRET || "speech-db-secret-key";
+
+// =========================
+// CORS
+// =========================
+
+const allowedOrigins = [
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+  "https://swar-saathi.netlify.app",
+];
+
+app.use(
+  cors({
+    origin: function (origin, callback) {
+      // Allow requests with no origin
+      // (Postman, server-to-server requests, etc.)
+      if (!origin) {
+        return callback(null, true);
+      }
+
+      if (allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      console.log("⚠️ Blocked CORS origin:", origin);
+      return callback(new Error("Not allowed by CORS"));
+    },
+  })
+);
+
+app.use(express.json());
+
+// =========================
+// FILE UPLOAD
+// =========================
 
 const upload = multer({
   dest: "uploads/",
@@ -30,7 +74,9 @@ const authenticateToken = (req, res, next) => {
 
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
+
     req.user = decoded;
+
     next();
   } catch (error) {
     return res.status(403).json({
@@ -40,19 +86,25 @@ const authenticateToken = (req, res, next) => {
 };
 
 // =========================
-// MIDDLEWARE
-// =========================
-
-app.use(cors());
-app.use(express.json());
-
-// =========================
 // HOME
 // =========================
 
 app.get("/", (req, res) => {
   res.json({
     message: "Speech-DB backend is working! 🚀",
+    frontend: "https://swar-saathi.netlify.app",
+    status: "online",
+  });
+});
+
+// =========================
+// HEALTH CHECK
+// =========================
+
+app.get("/health", (req, res) => {
+  res.json({
+    status: "ok",
+    message: "Swar Saathi backend is healthy",
   });
 });
 
@@ -745,7 +797,6 @@ app.get(
   authenticateToken,
   async (req, res) => {
     try {
-      // Make sure this is a therapist
       if (req.user.role !== "THERAPIST") {
         return res.status(403).json({
           error:
@@ -1052,10 +1103,8 @@ app.get(
 // START SERVER
 // =========================
 
-const PORT = 3000;
-
 app.listen(PORT, () => {
   console.log(
-    `🚀 Server running at http://localhost:${PORT}`
+    `🚀 Swar Saathi backend running on port ${PORT}`
   );
 });
