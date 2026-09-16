@@ -1,9 +1,12 @@
+require("dotenv").config();
+
 const express = require("express");
 const cors = require("cors");
 const { PrismaClient } = require("@prisma/client");
 const multer = require("multer");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const Anthropic = require("@anthropic-ai/sdk");
 
 const app = express();
 const prisma = new PrismaClient();
@@ -19,32 +22,26 @@ const PORT = process.env.PORT || 3000;
 const JWT_SECRET =
   process.env.JWT_SECRET || "speech-db-secret-key";
 
+const VALID_ROLES = ["PATIENT", "THERAPIST", "CAREGIVER"];
+
+// Set ANTHROPIC_API_KEY in Render's Environment tab to enable AI-generated
+// exercises. If it's missing, the app still runs — exercise generation is
+// just skipped instead of crashing anything.
+const anthropic = process.env.ANTHROPIC_API_KEY
+  ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+  : null;
+
 // =========================
 // CORS
 // =========================
 
-const allowedOrigins = [
-  "http://localhost:5173",
-  "http://127.0.0.1:5173",
-  "https://swar-saathi.netlify.app",
-];
-
+// Allow frontend requests from Netlify, localhost,
+// and other clients during the hackathon.
 app.use(
   cors({
-    origin: function (origin, callback) {
-      // Allow requests with no origin
-      // (Postman, server-to-server requests, etc.)
-      if (!origin) {
-        return callback(null, true);
-      }
-
-      if (allowedOrigins.includes(origin)) {
-        return callback(null, true);
-      }
-
-      console.log("⚠️ Blocked CORS origin:", origin);
-      return callback(new Error("Not allowed by CORS"));
-    },
+    origin: true,
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 
@@ -105,6 +102,7 @@ app.get("/health", (req, res) => {
   res.json({
     status: "ok",
     message: "Swar Saathi backend is healthy",
+    aiExercisesEnabled: Boolean(anthropic),
   });
 });
 
@@ -131,6 +129,123 @@ app.get("/api/users", authenticateToken, async (req, res) => {
 
     res.status(500).json({
       error: "Failed to fetch users",
+    });
+  }
+});
+
+// =========================
+// REGISTER
+// =========================
+
+app.post("/api/auth/register", async (req, res) => {
+  try {
+    const { fullName, email, password, role, dateOfBirth } = req.body;
+
+    if (!fullName || !email || !password) {
+      return res.status(400).json({
+        error: "Full name, email and password are required",
+      });
+    }
+
+    if (password.length < 8) {
+      return res.status(400).json({
+        error: "Password must be at least 8 characters",
+      });
+    }
+
+    const normalizedRole = VALID_ROLES.includes(role) ? role : "PATIENT";
+    const normalizedEmail = String(email).trim().toLowerCase();
+
+    if (normalizedRole === "PATIENT" && !dateOfBirth) {
+      return res.status(400).json({
+        error: "Date of birth is required for patient accounts",
+      });
+    }
+
+    let parsedDateOfBirth = null;
+    if (normalizedRole === "PATIENT") {
+      parsedDateOfBirth = new Date(dateOfBirth);
+      if (Number.isNaN(parsedDateOfBirth.getTime())) {
+        return res.status(400).json({
+          error: "That date of birth doesn't look valid",
+        });
+      }
+    }
+
+    const existing = await prisma.user.findUnique({
+      where: { email: normalizedEmail },
+    });
+
+    if (existing) {
+      return res.status(409).json({
+        error: "An account with this email already exists",
+      });
+    }
+
+    let organization = await prisma.organization.findFirst();
+    if (!organization) {
+      organization = await prisma.organization.create({
+        data: {
+          name: "Swar Saathi",
+          slug: `swar-saathi-${Date.now()}`,
+          country: "India",
+        },
+      });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    const user = await prisma.user.create({
+      data: {
+        organizationId: organization.id,
+        email: normalizedEmail,
+        fullName: String(fullName).trim(),
+        role: normalizedRole,
+        passwordHash,
+      },
+    });
+
+    if (normalizedRole === "PATIENT") {
+      await prisma.patientProfile.create({
+        data: {
+          userId: user.id,
+          organizationId: organization.id,
+          currentDifficultyLevel: 1,
+          dateOfBirth: parsedDateOfBirth,
+          primaryDiagnosis: "Pending assessment",
+          clinicalNotes: "No clinical notes yet — pending first session.",
+        },
+      });
+    }
+
+    const token = jwt.sign(
+      { userId: user.id, role: user.role },
+      JWT_SECRET,
+      { expiresIn: "1h" }
+    );
+
+    res.status(201).json({
+      message: "Account created successfully",
+      token,
+      user: {
+        id: user.id,
+        email: user.email,
+        fullName: user.fullName,
+        role: user.role,
+        organizationId: user.organizationId,
+      },
+    });
+  } catch (error) {
+    console.error("❌ Register error:", error);
+
+    if (error.code === "P2002") {
+      return res.status(409).json({
+        error: "An account with this email already exists",
+      });
+    }
+
+    res.status(500).json({
+      error: "Failed to create account",
     });
   }
 });
@@ -339,6 +454,161 @@ app.get(
 );
 
 // =========================
+// AI EXERCISE GENERATION
+// =========================
+//
+// Uses the patient's current difficulty level, diagnosis/clinical notes,
+// and their most recent practice scores to ask Claude for a fresh batch
+// of exercises, then saves them as real Exercise rows and assigns them —
+// so they show up exactly like therapist-assigned exercises on both the
+// patient and therapist dashboards.
+
+async function generateExercisesForPatient({ patientProfile, recentLogs, count = 3 }) {
+  if (!anthropic) {
+    throw new Error("AI exercise generation isn't configured (ANTHROPIC_API_KEY is missing)");
+  }
+
+  const recentScoresText = recentLogs.length
+    ? recentLogs
+        .slice(0, 5)
+        .map(
+          (l) =>
+            `${Math.round(l.pronunciationScore)}% pronunciation, ${Math.round(l.clarityScore)}% clarity`
+        )
+        .join("; ")
+    : "no practice sessions yet";
+
+  const prompt = `You are a speech-language pathologist assistant generating home practice exercises for a speech therapy app.
+
+Patient context:
+- Current difficulty level: ${patientProfile.currentDifficultyLevel} (scale 1-5, 1 easiest, 5 hardest)
+- Primary diagnosis: ${patientProfile.primaryDiagnosis}
+- Clinical notes: ${patientProfile.clinicalNotes}
+- Recent practice results (most recent first): ${recentScoresText}
+
+Generate ${count} new home speech exercises suited to this patient's current level. Vary the category across ARTICULATION, FLUENCY, and VOICE where it makes sense for the diagnosis. Keep instructions short, concrete, and safe to follow alone at home with no supervision.
+
+Respond with ONLY a JSON array (no markdown fences, no other text) in exactly this shape:
+[
+  {
+    "title": "string, under 8 words",
+    "description": "one sentence",
+    "category": "ARTICULATION" | "FLUENCY" | "VOICE",
+    "difficultyLevel": integer 1-5,
+    "targetPhonemes": ["string", ...],
+    "instructions": "one or two sentences the patient reads and follows",
+    "gamePointsValue": integer 5-30
+  }
+]`;
+
+  const response = await anthropic.messages.create({
+    model: "claude-sonnet-5",
+    max_tokens: 1500,
+    messages: [{ role: "user", content: prompt }],
+  });
+
+  const text = response.content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("");
+
+  const cleaned = text.replace(/```json|```/g, "").trim();
+
+  let generated;
+  try {
+    generated = JSON.parse(cleaned);
+  } catch {
+    throw new Error("AI response wasn't valid JSON — try again");
+  }
+  if (!Array.isArray(generated) || !generated.length) {
+    throw new Error("AI response didn't contain any exercises");
+  }
+  return generated;
+}
+
+async function createAndAssignExercises({ generated, patientProfile, userId }) {
+  const dueDate = new Date();
+  dueDate.setDate(dueDate.getDate() + 7);
+
+  const created = [];
+  for (const item of generated) {
+    const category = ["ARTICULATION", "FLUENCY", "VOICE"].includes(item.category)
+      ? item.category
+      : "ARTICULATION";
+    const difficultyLevel = Number.isInteger(item.difficultyLevel)
+      ? Math.max(1, Math.min(5, item.difficultyLevel))
+      : patientProfile.currentDifficultyLevel;
+
+    const exercise = await prisma.exercise.create({
+      data: {
+        organizationId: patientProfile.organizationId,
+        createdById: userId,
+        title: String(item.title || "Practice exercise").slice(0, 200),
+        description: String(item.description || ""),
+        category,
+        difficultyLevel,
+        targetPhonemes: Array.isArray(item.targetPhonemes)
+          ? item.targetPhonemes.map(String)
+          : [],
+        instructions: String(item.instructions || ""),
+        gamePointsValue: Number.isInteger(item.gamePointsValue) ? item.gamePointsValue : 10,
+      },
+    });
+
+    const assignment = await prisma.exerciseAssignment.create({
+      data: {
+        organizationId: patientProfile.organizationId,
+        patientProfileId: patientProfile.id,
+        exerciseId: exercise.id,
+        assignedById: userId,
+        dueDate,
+      },
+      include: { exercise: true },
+    });
+
+    created.push(assignment);
+  }
+  return created;
+}
+
+// Manual trigger — the patient, their therapist, or a caregiver can request
+// a fresh batch of exercises on demand.
+app.post(
+  "/api/patients/:patientId/generate-exercises",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const { patientId } = req.params;
+
+      const patientProfile = await prisma.patientProfile.findUnique({
+        where: { userId: patientId },
+      });
+      if (!patientProfile) {
+        return res.status(404).json({ error: "Patient profile not found" });
+      }
+
+      const recentLogs = await prisma.audioLog.findMany({
+        where: { patientProfileId: patientProfile.id },
+        orderBy: { recordedAt: "desc" },
+        take: 5,
+      });
+
+      const generated = await generateExercisesForPatient({ patientProfile, recentLogs });
+      const created = await createAndAssignExercises({
+        generated,
+        patientProfile,
+        userId: req.user.userId,
+      });
+
+      res.json({ message: "New exercises generated", assignments: created });
+    } catch (error) {
+      console.error("❌ Exercise generation error:", error);
+      res.status(500).json({ error: error.message || "Failed to generate exercises" });
+    }
+  }
+);
+
+// =========================
 // AUDIO UPLOAD + ANALYSIS
 // =========================
 
@@ -350,10 +620,6 @@ app.post(
     try {
       console.log("🎙️ Audio upload started");
 
-      // -------------------------
-      // CHECK FILE
-      // -------------------------
-
       if (!req.file) {
         return res.status(400).json({
           error: "No audio file uploaded",
@@ -362,20 +628,8 @@ app.post(
 
       console.log("🎙️ Audio received:", req.file);
       console.log("🎵 Audio MIME type:", req.file.mimetype);
-
-      console.log(
-        "👤 Logged in user ID:",
-        req.user.userId
-      );
-
-      console.log(
-        "👤 Logged in role:",
-        req.user.role
-      );
-
-      // -------------------------
-      // GET PATIENT PROFILE
-      // -------------------------
+      console.log("👤 Logged in user ID:", req.user.userId);
+      console.log("👤 Logged in role:", req.user.role);
 
       const patientProfile =
         await prisma.patientProfile.findUnique({
@@ -395,14 +649,7 @@ app.post(
         });
       }
 
-      console.log(
-        "✅ Patient profile found:",
-        patientProfile.id
-      );
-
-      // -------------------------
-      // GET ASSIGNED EXERCISE
-      // -------------------------
+      console.log("✅ Patient profile found:", patientProfile.id);
 
       const assignment =
         await prisma.exerciseAssignment.findFirst({
@@ -420,128 +667,51 @@ app.post(
         });
       }
 
-      console.log(
-        "✅ Exercise assignment found:",
-        assignment.id
-      );
+      console.log("✅ Exercise assignment found:", assignment.id);
 
-      // -------------------------
-      // GET ANALYSIS VALUES
-      // -------------------------
-
-      const durationSeconds = Number(
-        req.body.durationSeconds || 0
-      );
-
-      const pitchMeanHz = Number(
-        req.body.pitchMeanHz || 0
-      );
-
-      const clarityScore = Number(
-        req.body.clarityScore || 0
-      );
-
-      const pronunciationScore = Number(
-        req.body.pronunciationScore || 0
-      );
+      const durationSeconds = Number(req.body.durationSeconds || 0);
+      const pitchMeanHz = Number(req.body.pitchMeanHz || 0);
+      const clarityScore = Number(req.body.clarityScore || 0);
+      const pronunciationScore = Number(req.body.pronunciationScore || 0);
 
       console.log("📊 Analysis received:");
-
-      console.log(
-        "Duration:",
-        durationSeconds,
-        "seconds"
-      );
-
-      console.log(
-        "Pitch:",
-        pitchMeanHz,
-        "Hz"
-      );
-
-      console.log(
-        "Clarity:",
-        clarityScore,
-        "%"
-      );
-
-      console.log(
-        "Pronunciation:",
-        pronunciationScore,
-        "%"
-      );
-
-      // -------------------------
-      // SAVE AUDIO LOG
-      // -------------------------
+      console.log("Duration:", durationSeconds, "seconds");
+      console.log("Pitch:", pitchMeanHz, "Hz");
+      console.log("Clarity:", clarityScore, "%");
+      console.log("Pronunciation:", pronunciationScore, "%");
 
       const audioLog =
         await prisma.audioLog.create({
           data: {
-            organizationId:
-              patientProfile.organizationId,
-
-            patientProfileId:
-              patientProfile.id,
-
-            exerciseId:
-              assignment.exerciseId,
-
-            s3Url:
-              req.file.path,
-
-            durationSeconds:
-              durationSeconds,
-
-            pitchMeanHz:
-              pitchMeanHz,
-
-            clarityScore:
-              clarityScore,
-
-            pronunciationScore:
-              pronunciationScore,
-
-            difficultyAtAttempt:
-              patientProfile.currentDifficultyLevel,
+            organizationId: patientProfile.organizationId,
+            patientProfileId: patientProfile.id,
+            exerciseId: assignment.exerciseId,
+            s3Url: req.file.path,
+            durationSeconds: durationSeconds,
+            pitchMeanHz: pitchMeanHz,
+            clarityScore: clarityScore,
+            pronunciationScore: pronunciationScore,
+            difficultyAtAttempt: patientProfile.currentDifficultyLevel,
           },
         });
 
-      console.log(
-        "💾 AudioLog saved successfully:",
-        audioLog.id
-      );
+      console.log("💾 AudioLog saved successfully:", audioLog.id);
 
-      // -------------------------
-      // DYNAMIC DIFFICULTY
-      // -------------------------
-
-      let newDifficulty =
-        patientProfile.currentDifficultyLevel;
+      let newDifficulty = patientProfile.currentDifficultyLevel;
 
       if (pronunciationScore >= 85) {
-        newDifficulty = Math.min(
-          5,
-          patientProfile.currentDifficultyLevel + 1
-        );
+        newDifficulty = Math.min(5, patientProfile.currentDifficultyLevel + 1);
       } else if (pronunciationScore < 60) {
-        newDifficulty = Math.max(
-          1,
-          patientProfile.currentDifficultyLevel - 1
-        );
+        newDifficulty = Math.max(1, patientProfile.currentDifficultyLevel - 1);
       }
 
-      if (
-        newDifficulty !==
-        patientProfile.currentDifficultyLevel
-      ) {
+      if (newDifficulty !== patientProfile.currentDifficultyLevel) {
         await prisma.patientProfile.update({
           where: {
             id: patientProfile.id,
           },
           data: {
-            currentDifficultyLevel:
-              newDifficulty,
+            currentDifficultyLevel: newDifficulty,
           },
         });
 
@@ -553,54 +723,61 @@ app.post(
         );
       }
 
-      // -------------------------
-      // RESPONSE
-      // -------------------------
+      // Auto-generate more exercises when the patient is running low on
+      // incomplete ones, or right after their difficulty level changes.
+      // This never blocks or fails the upload response — if AI generation
+      // isn't configured or errors out, we just skip it.
+      let autoGenerated = false;
+      try {
+        const incompleteCount = await prisma.exerciseAssignment.count({
+          where: { patientProfileId: patientProfile.id, isCompleted: false },
+        });
+        const difficultyChanged = newDifficulty !== patientProfile.currentDifficultyLevel;
+
+        if (anthropic && (incompleteCount < 2 || difficultyChanged)) {
+          const recentLogs = await prisma.audioLog.findMany({
+            where: { patientProfileId: patientProfile.id },
+            orderBy: { recordedAt: "desc" },
+            take: 5,
+          });
+          const generated = await generateExercisesForPatient({
+            patientProfile: { ...patientProfile, currentDifficultyLevel: newDifficulty },
+            recentLogs,
+          });
+          await createAndAssignExercises({
+            generated,
+            patientProfile,
+            userId: req.user.userId,
+          });
+          autoGenerated = true;
+          console.log("🤖 Auto-generated new exercises for patient", patientProfile.id);
+        }
+      } catch (genErr) {
+        console.error("⚠️ Auto exercise generation skipped:", genErr.message);
+      }
 
       res.json({
-        message:
-          "Speech analyzed and uploaded successfully!",
-
-        filename:
-          req.file.filename,
-
-        path:
-          req.file.path,
-
-        audioLogId:
-          audioLog.id,
-
+        message: "Speech analyzed and uploaded successfully!",
+        filename: req.file.filename,
+        path: req.file.path,
+        audioLogId: audioLog.id,
         analysis: {
-          durationSeconds:
-            durationSeconds,
-
-          pitchMeanHz:
-            pitchMeanHz,
-
-          clarityScore:
-            clarityScore,
-
-          pronunciationScore:
-            pronunciationScore,
+          durationSeconds: durationSeconds,
+          pitchMeanHz: pitchMeanHz,
+          clarityScore: clarityScore,
+          pronunciationScore: pronunciationScore,
         },
-
         difficulty: {
-          previous:
-            patientProfile.currentDifficultyLevel,
-
-          current:
-            newDifficulty,
+          previous: patientProfile.currentDifficultyLevel,
+          current: newDifficulty,
         },
+        newExercisesGenerated: autoGenerated,
       });
     } catch (error) {
-      console.error(
-        "❌ Audio upload error:",
-        error
-      );
+      console.error("❌ Audio upload error:", error);
 
       res.status(500).json({
-        error:
-          "Failed to upload and save audio",
+        error: "Failed to upload and save audio",
       });
     }
   }
@@ -633,8 +810,7 @@ app.get(
       const audioLogs =
         await prisma.audioLog.findMany({
           where: {
-            patientProfileId:
-              patientProfile.id,
+            patientProfileId: patientProfile.id,
           },
           include: {
             exercise: true,
@@ -646,14 +822,10 @@ app.get(
 
       res.json(audioLogs);
     } catch (error) {
-      console.error(
-        "❌ Audio logs error:",
-        error
-      );
+      console.error("❌ Audio logs error:", error);
 
       res.status(500).json({
-        error:
-          "Failed to fetch audio logs",
+        error: "Failed to fetch audio logs",
       });
     }
   }
@@ -699,8 +871,7 @@ app.get(
       const assignments =
         await prisma.exerciseAssignment.findMany({
           where: {
-            patientProfileId:
-              patientProfile.id,
+            patientProfileId: patientProfile.id,
           },
           include: {
             exercise: true,
@@ -713,8 +884,7 @@ app.get(
       const audioLogs =
         await prisma.audioLog.findMany({
           where: {
-            patientProfileId:
-              patientProfile.id,
+            patientProfileId: patientProfile.id,
           },
           include: {
             exercise: true,
@@ -724,65 +894,35 @@ app.get(
           },
         });
 
-      const latestAudio =
-        audioLogs.length > 0
-          ? audioLogs[0]
-          : null;
+      const latestAudio = audioLogs.length > 0 ? audioLogs[0] : null;
 
       res.json({
         patient: user,
-
         profile: {
           id: patientProfile.id,
-
-          currentDifficultyLevel:
-            patientProfile.currentDifficultyLevel,
-
-          diagnosis:
-            patientProfile.diagnosis,
-
-          dateOfBirth:
-            patientProfile.dateOfBirth,
+          currentDifficultyLevel: patientProfile.currentDifficultyLevel,
+          diagnosis: patientProfile.primaryDiagnosis,
+          clinicalNotes: patientProfile.clinicalNotes,
+          dateOfBirth: patientProfile.dateOfBirth,
         },
-
-        exercises:
-          assignments,
-
-        audioLogs:
-          audioLogs,
-
-        latestAnalysis:
-          latestAudio
-            ? {
-                durationSeconds:
-                  latestAudio.durationSeconds,
-
-                pitchMeanHz:
-                  latestAudio.pitchMeanHz,
-
-                clarityScore:
-                  latestAudio.clarityScore,
-
-                pronunciationScore:
-                  latestAudio.pronunciationScore,
-
-                difficultyAtAttempt:
-                  latestAudio.difficultyAtAttempt,
-
-                recordedAt:
-                  latestAudio.recordedAt,
-              }
-            : null,
+        exercises: assignments,
+        audioLogs: audioLogs,
+        latestAnalysis: latestAudio
+          ? {
+              durationSeconds: latestAudio.durationSeconds,
+              pitchMeanHz: latestAudio.pitchMeanHz,
+              clarityScore: latestAudio.clarityScore,
+              pronunciationScore: latestAudio.pronunciationScore,
+              difficultyAtAttempt: latestAudio.difficultyAtAttempt,
+              recordedAt: latestAudio.recordedAt,
+            }
+          : null,
       });
     } catch (error) {
-      console.error(
-        "❌ Dashboard error:",
-        error
-      );
+      console.error("❌ Dashboard error:", error);
 
       res.status(500).json({
-        error:
-          "Failed to fetch patient dashboard",
+        error: "Failed to fetch patient dashboard",
       });
     }
   }
@@ -799,8 +939,7 @@ app.get(
     try {
       if (req.user.role !== "THERAPIST") {
         return res.status(403).json({
-          error:
-            "Only therapists can access this dashboard",
+          error: "Only therapists can access this dashboard",
         });
       }
 
@@ -834,48 +973,33 @@ app.get(
             if (!profile) {
               return {
                 ...patient,
-
-                currentDifficultyLevel:
-                  0,
-
-                exerciseCount:
-                  0,
-
-                audioLogCount:
-                  0,
-
-                latestPronunciationScore:
-                  0,
-
-                latestClarityScore:
-                  0,
-
-                latestPitchMeanHz:
-                  0,
+                currentDifficultyLevel: 0,
+                exerciseCount: 0,
+                audioLogCount: 0,
+                latestPronunciationScore: 0,
+                latestClarityScore: 0,
+                latestPitchMeanHz: 0,
               };
             }
 
             const exerciseCount =
               await prisma.exerciseAssignment.count({
                 where: {
-                  patientProfileId:
-                    profile.id,
+                  patientProfileId: profile.id,
                 },
               });
 
             const audioLogCount =
               await prisma.audioLog.count({
                 where: {
-                  patientProfileId:
-                    profile.id,
+                  patientProfileId: profile.id,
                 },
               });
 
             const latestAudio =
               await prisma.audioLog.findFirst({
                 where: {
-                  patientProfileId:
-                    profile.id,
+                  patientProfileId: profile.id,
                 },
                 orderBy: {
                   recordedAt: "desc",
@@ -884,38 +1008,22 @@ app.get(
 
             return {
               ...patient,
-
-              currentDifficultyLevel:
-                profile.currentDifficultyLevel,
-
-              diagnosis:
-                profile.diagnosis,
-
-              exerciseCount:
-                exerciseCount,
-
-              audioLogCount:
-                audioLogCount,
-
-              latestPronunciationScore:
-                latestAudio
-                  ? latestAudio.pronunciationScore
-                  : 0,
-
-              latestClarityScore:
-                latestAudio
-                  ? latestAudio.clarityScore
-                  : 0,
-
-              latestPitchMeanHz:
-                latestAudio
-                  ? latestAudio.pitchMeanHz
-                  : 0,
-
-              latestRecordedAt:
-                latestAudio
-                  ? latestAudio.recordedAt
-                  : null,
+              currentDifficultyLevel: profile.currentDifficultyLevel,
+              diagnosis: profile.primaryDiagnosis,
+              exerciseCount: exerciseCount,
+              audioLogCount: audioLogCount,
+              latestPronunciationScore: latestAudio
+                ? latestAudio.pronunciationScore
+                : 0,
+              latestClarityScore: latestAudio
+                ? latestAudio.clarityScore
+                : 0,
+              latestPitchMeanHz: latestAudio
+                ? latestAudio.pitchMeanHz
+                : 0,
+              latestRecordedAt: latestAudio
+                ? latestAudio.recordedAt
+                : null,
             };
           })
         );
@@ -925,22 +1033,14 @@ app.get(
           id: req.user.userId,
           role: req.user.role,
         },
-
-        totalPatients:
-          patientsWithStats.length,
-
-        patients:
-          patientsWithStats,
+        totalPatients: patientsWithStats.length,
+        patients: patientsWithStats,
       });
     } catch (error) {
-      console.error(
-        "❌ Therapist dashboard error:",
-        error
-      );
+      console.error("❌ Therapist dashboard error:", error);
 
       res.status(500).json({
-        error:
-          "Failed to load therapist dashboard",
+        error: "Failed to load therapist dashboard",
       });
     }
   }
@@ -957,8 +1057,7 @@ app.get(
     try {
       if (req.user.role !== "THERAPIST") {
         return res.status(403).json({
-          error:
-            "Only therapists can access patient details",
+          error: "Only therapists can access patient details",
         });
       }
 
@@ -1001,8 +1100,7 @@ app.get(
       const exercises =
         await prisma.exerciseAssignment.findMany({
           where: {
-            patientProfileId:
-              profile.id,
+            patientProfileId: profile.id,
           },
           include: {
             exercise: true,
@@ -1015,8 +1113,7 @@ app.get(
       const audioLogs =
         await prisma.audioLog.findMany({
           where: {
-            patientProfileId:
-              profile.id,
+            patientProfileId: profile.id,
           },
           include: {
             exercise: true,
@@ -1028,22 +1125,21 @@ app.get(
 
       res.json({
         patient,
-
-        profile,
-
+        profile: {
+          id: profile.id,
+          currentDifficultyLevel: profile.currentDifficultyLevel,
+          diagnosis: profile.primaryDiagnosis,
+          clinicalNotes: profile.clinicalNotes,
+          dateOfBirth: profile.dateOfBirth,
+        },
         exercises,
-
         audioLogs,
       });
     } catch (error) {
-      console.error(
-        "❌ Therapist patient error:",
-        error
-      );
+      console.error("❌ Therapist patient error:", error);
 
       res.status(500).json({
-        error:
-          "Failed to fetch patient details",
+        error: "Failed to fetch patient details",
       });
     }
   }
@@ -1076,8 +1172,7 @@ app.get(
       const feedback =
         await prisma.caregiverFeedback.findMany({
           where: {
-            patientProfileId:
-              profile.id,
+            patientProfileId: profile.id,
           },
           orderBy: {
             createdAt: "desc",
@@ -1086,14 +1181,10 @@ app.get(
 
       res.json(feedback);
     } catch (error) {
-      console.error(
-        "❌ Feedback error:",
-        error
-      );
+      console.error("❌ Feedback error:", error);
 
       res.status(500).json({
-        error:
-          "Failed to fetch caregiver feedback",
+        error: "Failed to fetch caregiver feedback",
       });
     }
   }
@@ -1104,7 +1195,5 @@ app.get(
 // =========================
 
 app.listen(PORT, () => {
-  console.log(
-    `🚀 Swar Saathi backend running on port ${PORT}`
-  );
+  console.log(`🚀 Swar Saathi backend running on port ${PORT}`);
 });
