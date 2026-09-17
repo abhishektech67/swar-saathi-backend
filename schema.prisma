@@ -67,6 +67,11 @@ model PatientProfile {
   primaryDiagnosis       String
   clinicalNotes          String
   currentDifficultyLevel Int                  @default(1)
+  // --- Gamification / engagement tracking ---
+  totalPoints            Int                  @default(0)
+  currentStreak          Int                  @default(0)
+  longestStreak          Int                  @default(0)
+  lastPracticeAt         DateTime?
   therapists             PatientTherapist[]
   caregivers             PatientCaregiver[]
   exerciseAssignments    ExerciseAssignment[]
@@ -104,7 +109,7 @@ model Exercise {
   difficultyLevel     Int
   targetPhonemes      String[]
   instructions        String
-  gamePointsValue     Int                  @default(10)
+  gamePointsValue      Int                  @default(10)
   exerciseAssignments ExerciseAssignment[]
   audioLogs           AudioLog[]
 }
@@ -120,6 +125,8 @@ model ExerciseAssignment {
   assignedById     String
   assignedBy       User           @relation(fields: [assignedById], references: [id])
   isCompleted      Boolean        @default(false)
+  completedAt      DateTime?
+  pointsAwarded    Int            @default(0)
   dueDate          DateTime
 }
 
@@ -135,7 +142,7 @@ model AudioLog {
   durationSeconds     Float
   pitchMeanHz         Float
   clarityScore        Float
-  pronunciationScore Float
+  pronunciationScore  Float
   difficultyAtAttempt Int
   recordedAt          DateTime       @default(now())
 }

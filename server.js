@@ -25,8 +25,8 @@ const JWT_SECRET =
 const VALID_ROLES = ["PATIENT", "THERAPIST", "CAREGIVER"];
 
 // Set ANTHROPIC_API_KEY in Render's Environment tab to enable AI-generated
-// exercises. If it's missing, the app still runs — exercise generation is
-// just skipped instead of crashing anything.
+// exercises and AI-generated clinical recommendations. If it's missing, the
+// app still runs — those features are just skipped instead of crashing.
 const anthropic = process.env.ANTHROPIC_API_KEY
   ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
   : null;
@@ -35,8 +35,6 @@ const anthropic = process.env.ANTHROPIC_API_KEY
 // CORS
 // =========================
 
-// Allow frontend requests from Netlify, localhost,
-// and other clients during the hackathon.
 app.use(
   cors({
     origin: true,
@@ -397,6 +395,90 @@ app.get(
 );
 
 // =========================
+// MARK EXERCISE COMPLETE (Gamification)
+// =========================
+//
+// Awards the exercise's gamePointsValue to the patient's running total,
+// and updates a daily practice streak (consecutive calendar days on which
+// at least one exercise was completed). This is what actually makes the
+// "gamePointsValue" field on Exercise meaningful — previously it was
+// stored but never used anywhere.
+
+app.post(
+  "/api/exercise-assignments/:assignmentId/complete",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const { assignmentId } = req.params;
+
+      const assignment = await prisma.exerciseAssignment.findUnique({
+        where: { id: assignmentId },
+        include: { exercise: true, patientProfile: true },
+      });
+
+      if (!assignment) {
+        return res.status(404).json({ error: "Assignment not found" });
+      }
+
+      if (assignment.isCompleted) {
+        return res.json({
+          message: "This exercise was already marked complete",
+          alreadyCompleted: true,
+          assignment,
+        });
+      }
+
+      const profile = assignment.patientProfile;
+      const points = assignment.exercise.gamePointsValue || 10;
+      const now = new Date();
+
+      // Streak logic: same calendar day keeps the streak, the very next
+      // day extends it by one, anything else resets it to 1.
+      let newStreak = 1;
+      if (profile.lastPracticeAt) {
+        const last = new Date(profile.lastPracticeAt);
+        const dayMs = 86400000;
+        const lastDay = Math.floor(last.setHours(0, 0, 0, 0) / dayMs);
+        const today = Math.floor(new Date(now).setHours(0, 0, 0, 0) / dayMs);
+        const diff = today - lastDay;
+        if (diff === 0) newStreak = profile.currentStreak || 1;
+        else if (diff === 1) newStreak = (profile.currentStreak || 0) + 1;
+        else newStreak = 1;
+      }
+      const newLongest = Math.max(profile.longestStreak || 0, newStreak);
+
+      const updatedAssignment = await prisma.exerciseAssignment.update({
+        where: { id: assignmentId },
+        data: { isCompleted: true, completedAt: now, pointsAwarded: points },
+        include: { exercise: true },
+      });
+
+      const updatedProfile = await prisma.patientProfile.update({
+        where: { id: profile.id },
+        data: {
+          totalPoints: (profile.totalPoints || 0) + points,
+          currentStreak: newStreak,
+          longestStreak: newLongest,
+          lastPracticeAt: now,
+        },
+      });
+
+      res.json({
+        message: "Exercise marked complete!",
+        pointsAwarded: points,
+        assignment: updatedAssignment,
+        totalPoints: updatedProfile.totalPoints,
+        currentStreak: updatedProfile.currentStreak,
+        longestStreak: updatedProfile.longestStreak,
+      });
+    } catch (error) {
+      console.error("❌ Complete exercise error:", error);
+      res.status(500).json({ error: "Failed to mark exercise complete" });
+    }
+  }
+);
+
+// =========================
 // PATIENT PROFILE / SUMMARY
 // =========================
 
@@ -609,6 +691,94 @@ app.post(
 );
 
 // =========================
+// AI CLINICAL RECOMMENDATION
+// =========================
+//
+// Asks Claude for a short, explainable clinical recommendation (whether to
+// change difficulty, what to focus on, and an encouragement note) based on
+// this patient's diagnosis and recent scores. This is on-demand (not
+// auto-run) so it never blocks other requests and never runs without the
+// therapist/caregiver explicitly asking for it.
+
+async function generateRecommendationForPatient({ patientProfile, recentLogs }) {
+  if (!anthropic) {
+    throw new Error("AI recommendations aren't configured (ANTHROPIC_API_KEY is missing)");
+  }
+
+  const scoresText = recentLogs.length
+    ? recentLogs
+        .slice(0, 5)
+        .map(
+          (l) =>
+            `${Math.round(l.pronunciationScore)}% pronunciation, ${Math.round(l.clarityScore)}% clarity, ~${Math.round(l.pitchMeanHz)}Hz pitch (level ${l.difficultyAtAttempt})`
+        )
+        .join("; ")
+    : "no practice sessions recorded yet";
+
+  const prompt = `You are a speech-language pathologist assistant. Write a short (3-4 sentence) therapy recommendation for a clinician reviewing this patient's dashboard.
+
+Diagnosis: ${patientProfile.primaryDiagnosis}
+Clinical notes: ${patientProfile.clinicalNotes}
+Current difficulty level: ${patientProfile.currentDifficultyLevel} (1-5, 1 easiest)
+Recent session results (most recent first): ${scoresText}
+
+Cover, in flowing plain text (no markdown, no headers, no bullet points):
+1. Whether to keep, increase, or decrease the difficulty level, and why.
+2. One specific focus area for the next few sessions.
+3. One short encouragement note suitable to relay to the patient or caregiver.`;
+
+  const response = await anthropic.messages.create({
+    model: "claude-sonnet-5",
+    max_tokens: 400,
+    messages: [{ role: "user", content: prompt }],
+  });
+
+  return response.content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("")
+    .trim();
+}
+
+app.post(
+  "/api/patients/:patientId/ai-recommendation",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      if (!["THERAPIST", "CAREGIVER"].includes(req.user.role)) {
+        return res.status(403).json({
+          error: "Only therapists or caregivers can request an AI recommendation",
+        });
+      }
+
+      const { patientId } = req.params;
+      const patientProfile = await prisma.patientProfile.findUnique({
+        where: { userId: patientId },
+      });
+      if (!patientProfile) {
+        return res.status(404).json({ error: "Patient profile not found" });
+      }
+
+      const recentLogs = await prisma.audioLog.findMany({
+        where: { patientProfileId: patientProfile.id },
+        orderBy: { recordedAt: "desc" },
+        take: 5,
+      });
+
+      const recommendation = await generateRecommendationForPatient({
+        patientProfile,
+        recentLogs,
+      });
+
+      res.json({ recommendation });
+    } catch (error) {
+      console.error("❌ AI recommendation error:", error);
+      res.status(500).json({ error: error.message || "Failed to generate recommendation" });
+    }
+  }
+);
+
+// =========================
 // AUDIO UPLOAD + ANALYSIS
 // =========================
 
@@ -626,11 +796,6 @@ app.post(
         });
       }
 
-      console.log("🎙️ Audio received:", req.file);
-      console.log("🎵 Audio MIME type:", req.file.mimetype);
-      console.log("👤 Logged in user ID:", req.user.userId);
-      console.log("👤 Logged in role:", req.user.role);
-
       const patientProfile =
         await prisma.patientProfile.findUnique({
           where: {
@@ -639,17 +804,10 @@ app.post(
         });
 
       if (!patientProfile) {
-        console.log(
-          "❌ Patient profile not found for user:",
-          req.user.userId
-        );
-
         return res.status(404).json({
           error: "Patient profile not found",
         });
       }
-
-      console.log("✅ Patient profile found:", patientProfile.id);
 
       const assignment =
         await prisma.exerciseAssignment.findFirst({
@@ -667,18 +825,10 @@ app.post(
         });
       }
 
-      console.log("✅ Exercise assignment found:", assignment.id);
-
       const durationSeconds = Number(req.body.durationSeconds || 0);
       const pitchMeanHz = Number(req.body.pitchMeanHz || 0);
       const clarityScore = Number(req.body.clarityScore || 0);
       const pronunciationScore = Number(req.body.pronunciationScore || 0);
-
-      console.log("📊 Analysis received:");
-      console.log("Duration:", durationSeconds, "seconds");
-      console.log("Pitch:", pitchMeanHz, "Hz");
-      console.log("Clarity:", clarityScore, "%");
-      console.log("Pronunciation:", pronunciationScore, "%");
 
       const audioLog =
         await prisma.audioLog.create({
@@ -904,6 +1054,9 @@ app.get(
           diagnosis: patientProfile.primaryDiagnosis,
           clinicalNotes: patientProfile.clinicalNotes,
           dateOfBirth: patientProfile.dateOfBirth,
+          totalPoints: patientProfile.totalPoints,
+          currentStreak: patientProfile.currentStreak,
+          longestStreak: patientProfile.longestStreak,
         },
         exercises: assignments,
         audioLogs: audioLogs,
@@ -979,6 +1132,8 @@ app.get(
                 latestPronunciationScore: 0,
                 latestClarityScore: 0,
                 latestPitchMeanHz: 0,
+                totalPoints: 0,
+                currentStreak: 0,
               };
             }
 
@@ -1024,6 +1179,8 @@ app.get(
               latestRecordedAt: latestAudio
                 ? latestAudio.recordedAt
                 : null,
+              totalPoints: profile.totalPoints,
+              currentStreak: profile.currentStreak,
             };
           })
         );
@@ -1131,6 +1288,9 @@ app.get(
           diagnosis: profile.primaryDiagnosis,
           clinicalNotes: profile.clinicalNotes,
           dateOfBirth: profile.dateOfBirth,
+          totalPoints: profile.totalPoints,
+          currentStreak: profile.currentStreak,
+          longestStreak: profile.longestStreak,
         },
         exercises,
         audioLogs,
@@ -1186,6 +1346,59 @@ app.get(
       res.status(500).json({
         error: "Failed to fetch caregiver feedback",
       });
+    }
+  }
+);
+
+// Submit remote feedback — previously there was no way for a caregiver (or
+// therapist) to actually WRITE feedback, only read it back. This is the
+// missing half of "Caregiver Collaboration" from the problem statement.
+app.post(
+  "/api/patients/:patientId/feedback",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      if (!["CAREGIVER", "THERAPIST"].includes(req.user.role)) {
+        return res.status(403).json({
+          error: "Only caregivers or therapists can submit feedback",
+        });
+      }
+
+      const { patientId } = req.params;
+      const { feedbackText, moodRating } = req.body;
+
+      if (!feedbackText || !String(feedbackText).trim()) {
+        return res.status(400).json({ error: "Feedback text is required" });
+      }
+
+      const rating = Number(moodRating);
+      if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+        return res
+          .status(400)
+          .json({ error: "Mood rating must be a whole number between 1 and 5" });
+      }
+
+      const profile = await prisma.patientProfile.findUnique({
+        where: { userId: patientId },
+      });
+      if (!profile) {
+        return res.status(404).json({ error: "Patient profile not found" });
+      }
+
+      const feedback = await prisma.caregiverFeedback.create({
+        data: {
+          organizationId: profile.organizationId,
+          patientProfileId: profile.id,
+          caregiverId: req.user.userId,
+          feedbackText: String(feedbackText).trim(),
+          moodRating: rating,
+        },
+      });
+
+      res.status(201).json(feedback);
+    } catch (error) {
+      console.error("❌ Feedback submit error:", error);
+      res.status(500).json({ error: "Failed to submit feedback" });
     }
   }
 );
