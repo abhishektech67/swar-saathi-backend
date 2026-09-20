@@ -6,7 +6,6 @@ const { PrismaClient } = require("@prisma/client");
 const multer = require("multer");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
-const Anthropic = require("@anthropic-ai/sdk");
 
 const app = express();
 const prisma = new PrismaClient();
@@ -24,12 +23,49 @@ const JWT_SECRET =
 
 const VALID_ROLES = ["PATIENT", "THERAPIST", "CAREGIVER"];
 
-// Set ANTHROPIC_API_KEY in Render's Environment tab to enable AI-generated
-// exercises and AI-generated clinical recommendations. If it's missing, the
-// app still runs — those features are just skipped instead of crashing.
-const anthropic = process.env.ANTHROPIC_API_KEY
-  ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
-  : null;
+// Set GEMINI_API_KEY in Render's Environment tab to enable AI-generated
+// exercises and AI-generated clinical recommendations.
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+
+// Calls Google's Gemini REST API. Node 18+ includes fetch, so no extra
+// Gemini SDK package is required.
+async function callGemini(prompt, { json = false } = {}) {
+  if (!GEMINI_API_KEY) {
+    throw new Error("Gemini AI is not configured (GEMINI_API_KEY is missing)");
+  }
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+  const body = {
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    ...(json
+      ? { generationConfig: { responseMimeType: "application/json" } }
+      : {}),
+  };
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  const data = await response.json();
+  if (!response.ok) {
+    const message = data?.error?.message || `Gemini request failed (${response.status})`;
+    throw new Error(message);
+  }
+
+  const text = data?.candidates?.[0]?.content?.parts
+    ?.map((part) => part.text || "")
+    .join("")
+    .trim();
+
+  if (!text) {
+    throw new Error("Gemini returned an empty response");
+  }
+
+  return text;
+}
 
 // =========================
 // CORS
@@ -100,7 +136,7 @@ app.get("/health", (req, res) => {
   res.json({
     status: "ok",
     message: "Swar Saathi backend is healthy",
-    aiExercisesEnabled: Boolean(anthropic),
+    aiExercisesEnabled: Boolean(GEMINI_API_KEY),
   });
 });
 
@@ -546,8 +582,8 @@ app.get(
 // patient and therapist dashboards.
 
 async function generateExercisesForPatient({ patientProfile, recentLogs, count = 3 }) {
-  if (!anthropic) {
-    throw new Error("AI exercise generation isn't configured (ANTHROPIC_API_KEY is missing)");
+  if (!GEMINI_API_KEY) {
+    throw new Error("AI exercise generation isn't configured (GEMINI_API_KEY is missing)");
   }
 
   const recentScoresText = recentLogs.length
@@ -583,17 +619,7 @@ Respond with ONLY a JSON array (no markdown fences, no other text) in exactly th
   }
 ]`;
 
-  const response = await anthropic.messages.create({
-    model: "claude-sonnet-5",
-    max_tokens: 1500,
-    messages: [{ role: "user", content: prompt }],
-  });
-
-  const text = response.content
-    .filter((block) => block.type === "text")
-    .map((block) => block.text)
-    .join("");
-
+  const text = await callGemini(prompt, { json: true });
   const cleaned = text.replace(/```json|```/g, "").trim();
 
   let generated;
@@ -701,8 +727,8 @@ app.post(
 // therapist/caregiver explicitly asking for it.
 
 async function generateRecommendationForPatient({ patientProfile, recentLogs }) {
-  if (!anthropic) {
-    throw new Error("AI recommendations aren't configured (ANTHROPIC_API_KEY is missing)");
+  if (!GEMINI_API_KEY) {
+    throw new Error("AI recommendations aren't configured (GEMINI_API_KEY is missing)");
   }
 
   const scoresText = recentLogs.length
@@ -727,17 +753,7 @@ Cover, in flowing plain text (no markdown, no headers, no bullet points):
 2. One specific focus area for the next few sessions.
 3. One short encouragement note suitable to relay to the patient or caregiver.`;
 
-  const response = await anthropic.messages.create({
-    model: "claude-sonnet-5",
-    max_tokens: 400,
-    messages: [{ role: "user", content: prompt }],
-  });
-
-  return response.content
-    .filter((block) => block.type === "text")
-    .map((block) => block.text)
-    .join("")
-    .trim();
+  return (await callGemini(prompt)).trim();
 }
 
 app.post(
@@ -884,7 +900,7 @@ app.post(
         });
         const difficultyChanged = newDifficulty !== patientProfile.currentDifficultyLevel;
 
-        if (anthropic && (incompleteCount < 2 || difficultyChanged)) {
+        if (GEMINI_API_KEY && (incompleteCount < 2 || difficultyChanged)) {
           const recentLogs = await prisma.audioLog.findMany({
             where: { patientProfileId: patientProfile.id },
             orderBy: { recordedAt: "desc" },
