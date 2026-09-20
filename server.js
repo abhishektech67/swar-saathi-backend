@@ -26,7 +26,7 @@ const VALID_ROLES = ["PATIENT", "THERAPIST", "CAREGIVER"];
 // Set GEMINI_API_KEY in Render's Environment tab to enable AI-generated
 // exercises and AI-generated clinical recommendations.
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.6-flash";
 
 // Calls Google's Gemini REST API. Node 18+ includes fetch, so no extra
 // Gemini SDK package is required.
