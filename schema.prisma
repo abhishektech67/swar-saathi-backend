@@ -77,6 +77,7 @@ model PatientProfile {
   exerciseAssignments    ExerciseAssignment[]
   audioLogs              AudioLog[]
   caregiverFeedbacks     CaregiverFeedback[]
+  wellnessCheckIns       WellnessCheckIn[]
 }
 
 model PatientTherapist {
@@ -109,7 +110,7 @@ model Exercise {
   difficultyLevel     Int
   targetPhonemes      String[]
   instructions        String
-  gamePointsValue      Int                  @default(10)
+  gamePointsValue     Int                  @default(10)
   exerciseAssignments ExerciseAssignment[]
   audioLogs           AudioLog[]
 }
@@ -158,4 +159,20 @@ model CaregiverFeedback {
   feedbackText     String
   moodRating       Int
   createdAt        DateTime       @default(now())
+}
+
+// NEW: daily wellness check-in (voice-health context for the AI)
+model WellnessCheckIn {
+  id               String         @id @default(uuid())
+  patientProfileId String
+  patientProfile   PatientProfile @relation(fields: [patientProfileId], references: [id])
+  mood             Int            // 1-5
+  fatigue          Int            // 1-5 (5 = very tired)
+  throatComfort    Int            // 1-5 (5 = very comfortable)
+  hydration        Int            // glasses of water today, 0-20
+  sleepHours       Float          // 0-24
+  notes            String         @default("")
+  createdAt        DateTime       @default(now())
+
+  @@index([patientProfileId, createdAt])
 }
