@@ -2,6 +2,7 @@ require("dotenv").config();
 
 const express = require("express");
 const cors = require("cors");
+const crypto = require("crypto");
 const { PrismaClient } = require("@prisma/client");
 const multer = require("multer");
 const bcrypt = require("bcryptjs");
@@ -9,6 +10,9 @@ const jwt = require("jsonwebtoken");
 
 const app = express();
 const prisma = new PrismaClient();
+
+// Render sits behind a proxy; this makes req.ip the real client IP (used by rate limits).
+app.set("trust proxy", 1);
 
 // =========================
 // CONFIGURATION
@@ -332,11 +336,7 @@ function contextToText(profile, ctx) {
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers["authorization"];
   const token = authHeader && authHeader.split(" ")[1];
-
-  if (!token) {
-    return res.status(401).json({ error: "Access token required" });
-  }
-
+  if (!token) return res.status(401).json({ error: "Access token required" });
   try {
     req.user = jwt.verify(token, JWT_SECRET);
     next();
@@ -345,18 +345,104 @@ const authenticateToken = (req, res, next) => {
   }
 };
 
-// A patient may only touch their own data. Therapists and caregivers can
-// access any patient (the app does not yet link them individually).
-function canAccessPatient(req, patientId) {
-  if (req.user.role === "PATIENT") return req.user.userId === patientId;
-  return ["THERAPIST", "CAREGIVER"].includes(req.user.role);
+// Who may see this patient's data?
+//  - PATIENT   -> only themselves
+//  - THERAPIST -> only patients who linked with their therapist code
+//  - CAREGIVER -> only patients whose invite code they entered
+async function canAccessPatient(req, patientUserId) {
+  const { userId, role } = req.user;
+  if (role === "PATIENT") return userId === patientUserId;
+
+  const profile = await prisma.patientProfile.findUnique({
+    where: { userId: patientUserId },
+    select: { id: true },
+  });
+  if (!profile) return false;
+
+  if (role === "THERAPIST") {
+    return Boolean(
+      await prisma.patientTherapist.findFirst({
+        where: { patientProfileId: profile.id, therapistId: userId },
+      })
+    );
+  }
+  if (role === "CAREGIVER") {
+    return Boolean(
+      await prisma.patientCaregiver.findFirst({
+        where: { patientProfileId: profile.id, caregiverId: userId },
+      })
+    );
+  }
+  return false;
 }
 
-function guardPatient(req, res, next) {
-  if (!canAccessPatient(req, req.params.patientId)) {
-    return res.status(403).json({ error: "You don't have access to this patient's data" });
+async function guardPatient(req, res, next) {
+  try {
+    if (!(await canAccessPatient(req, req.params.patientId))) {
+      return res.status(403).json({ error: "You don't have access to this patient's data" });
+    }
+    next();
+  } catch (error) {
+    console.error("❌ Access check error:", error);
+    res.status(500).json({ error: "Access check failed" });
   }
-  next();
+}
+
+// ---- Codes (therapist codes + patient invite codes) ----
+const CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I confusion
+
+function randomCode(prefix, len = 6) {
+  const bytes = crypto.randomBytes(len);
+  let s = "";
+  for (const b of bytes) s += CODE_CHARS[b % CODE_CHARS.length];
+  return `${prefix}-${s}`;
+}
+
+async function generateUniqueCode(prefix) {
+  for (let i = 0; i < 10; i++) {
+    const code = randomCode(prefix);
+    const taken =
+      prefix === "THR"
+        ? await prisma.user.findUnique({ where: { therapistCode: code }, select: { id: true } })
+        : await prisma.patientProfile.findUnique({ where: { inviteCode: code }, select: { id: true } });
+    if (!taken) return code;
+  }
+  throw new Error("Could not generate a unique code");
+}
+
+// Limits code guessing (separate from the AI limiter).
+const linkAttempts = new Map();
+function linkRateLimit(limit = 15) {
+  return (req, res, next) => {
+    const key = req.user?.userId || req.ip;
+    const hourAgo = Date.now() - 3600000;
+    const hits = (linkAttempts.get(key) || []).filter((t) => t > hourAgo);
+    if (hits.length >= limit) {
+      return res.status(429).json({ error: "Too many code attempts. Please try again in a while." });
+    }
+    hits.push(Date.now());
+    linkAttempts.set(key, hits);
+    next();
+  };
+}
+
+function publicUser(user) {
+  return {
+    id: user.id,
+    email: user.email,
+    fullName: user.fullName,
+    role: user.role,
+    organizationId: user.organizationId,
+    ...(user.role === "THERAPIST" ? { therapistCode: user.therapistCode } : {}),
+  };
+}
+
+async function listTherapists(patientProfileId) {
+  const rows = await prisma.patientTherapist.findMany({
+    where: { patientProfileId },
+    include: { therapist: { select: { id: true, fullName: true } } },
+  });
+  return rows.map((r) => ({ id: r.therapist.id, fullName: r.therapist.fullName }));
 }
 
 // =========================
@@ -398,33 +484,24 @@ app.get("/health", (req, res) => {
 });
 
 // =========================
-// USERS
+// ME
 // =========================
+// (The old GET /api/users route that listed every user has been removed on purpose.)
 
-app.get("/api/users", authenticateToken, async (req, res) => {
-  try {
-    if (req.user.role !== "THERAPIST") {
-      return res.status(403).json({ error: "Only therapists can list users" });
-    }
-    const users = await prisma.user.findMany({
-      select: { id: true, organizationId: true, email: true, fullName: true, role: true, createdAt: true },
-    });
-    res.json(users);
-  } catch (error) {
-    console.error("❌ Users error:", error);
-    res.status(500).json({ error: "Failed to fetch users" });
-  }
-});
-
-// Lets the frontend restore the full user (name, email) after a page refresh.
 app.get("/api/auth/me", authenticateToken, async (req, res) => {
   try {
-    const user = await prisma.user.findUnique({
-      where: { id: req.user.userId },
-      select: { id: true, email: true, fullName: true, role: true, organizationId: true },
-    });
+    const user = await prisma.user.findUnique({ where: { id: req.user.userId } });
     if (!user) return res.status(404).json({ error: "User not found" });
-    res.json({ user });
+
+    const out = publicUser(user);
+    if (user.role === "PATIENT") {
+      const profile = await prisma.patientProfile.findUnique({ where: { userId: user.id } });
+      if (profile) {
+        out.inviteCode = profile.inviteCode;
+        out.therapists = await listTherapists(profile.id);
+      }
+    }
+    res.json({ user: out });
   } catch (error) {
     console.error("❌ Me error:", error);
     res.status(500).json({ error: "Failed to load user" });
@@ -435,9 +512,9 @@ app.get("/api/auth/me", authenticateToken, async (req, res) => {
 // REGISTER
 // =========================
 
-app.post("/api/auth/register", async (req, res) => {
+app.post("/api/auth/register", linkRateLimit(20), async (req, res) => {
   try {
-    const { fullName, email, password, role, dateOfBirth } = req.body;
+    const { fullName, email, password, role, dateOfBirth, therapistCode } = req.body;
 
     if (!fullName || !email || !password) {
       return res.status(400).json({ error: "Full name, email and password are required" });
@@ -458,6 +535,16 @@ app.post("/api/auth/register", async (req, res) => {
       parsedDateOfBirth = new Date(dateOfBirth);
       if (Number.isNaN(parsedDateOfBirth.getTime())) {
         return res.status(400).json({ error: "That date of birth doesn't look valid" });
+      }
+    }
+
+    // Optional therapist code (patients only). Validate BEFORE creating anything.
+    let therapist = null;
+    const codeInput = String(therapistCode || "").trim().toUpperCase();
+    if (normalizedRole === "PATIENT" && codeInput) {
+      therapist = await prisma.user.findUnique({ where: { therapistCode: codeInput } });
+      if (!therapist) {
+        return res.status(400).json({ error: "That therapist code isn't valid. Check it, or leave it empty to continue without a therapist." });
       }
     }
 
@@ -482,11 +569,12 @@ app.post("/api/auth/register", async (req, res) => {
         fullName: String(fullName).trim(),
         role: normalizedRole,
         passwordHash,
+        therapistCode: normalizedRole === "THERAPIST" ? await generateUniqueCode("THR") : null,
       },
     });
 
     if (normalizedRole === "PATIENT") {
-      await prisma.patientProfile.create({
+      const profile = await prisma.patientProfile.create({
         data: {
           userId: user.id,
           organizationId: organization.id,
@@ -494,8 +582,14 @@ app.post("/api/auth/register", async (req, res) => {
           dateOfBirth: parsedDateOfBirth,
           primaryDiagnosis: "Pending assessment",
           clinicalNotes: "No clinical notes yet — pending first session.",
+          inviteCode: await generateUniqueCode("PAT"),
         },
       });
+      if (therapist) {
+        await prisma.patientTherapist.create({
+          data: { patientProfileId: profile.id, therapistId: therapist.id, isPrimary: true },
+        });
+      }
     }
 
     const token = jwt.sign({ userId: user.id, role: user.role }, JWT_SECRET, { expiresIn: "12h" });
@@ -503,13 +597,7 @@ app.post("/api/auth/register", async (req, res) => {
     res.status(201).json({
       message: "Account created successfully",
       token,
-      user: {
-        id: user.id,
-        email: user.email,
-        fullName: user.fullName,
-        role: user.role,
-        organizationId: user.organizationId,
-      },
+      user: publicUser(user),
     });
   } catch (error) {
     console.error("❌ Register error:", error);
@@ -527,7 +615,6 @@ app.post("/api/auth/register", async (req, res) => {
 app.post("/api/auth/login", async (req, res) => {
   try {
     const { email, password } = req.body;
-
     if (!email || !password) {
       return res.status(400).json({ error: "Email and password are required" });
     }
@@ -536,29 +623,14 @@ app.post("/api/auth/login", async (req, res) => {
     const user = await prisma.user.findUnique({
       where: { email: String(email).trim().toLowerCase() },
     });
-
-    if (!user) {
-      return res.status(401).json({ error: "Invalid email or password" });
-    }
+    if (!user) return res.status(401).json({ error: "Invalid email or password" });
 
     const passwordMatch = await bcrypt.compare(password, user.passwordHash);
-    if (!passwordMatch) {
-      return res.status(401).json({ error: "Invalid email or password" });
-    }
+    if (!passwordMatch) return res.status(401).json({ error: "Invalid email or password" });
 
     const token = jwt.sign({ userId: user.id, role: user.role }, JWT_SECRET, { expiresIn: "12h" });
 
-    res.json({
-      message: "Login successful",
-      token,
-      user: {
-        id: user.id,
-        email: user.email,
-        fullName: user.fullName,
-        role: user.role,
-        organizationId: user.organizationId,
-      },
-    });
+    res.json({ message: "Login successful", token, user: publicUser(user) });
   } catch (error) {
     console.error("❌ Login error:", error);
     res.status(500).json({ error: "Something went wrong" });
@@ -566,16 +638,111 @@ app.post("/api/auth/login", async (req, res) => {
 });
 
 // =========================
-// PATIENTS
+// LINKING (therapist code / caregiver invite code)
+// =========================
+
+// Patient enters a therapist's code (any time after signup).
+app.post("/api/patient/link-therapist", authenticateToken, linkRateLimit(15), async (req, res) => {
+  try {
+    if (req.user.role !== "PATIENT") {
+      return res.status(403).json({ error: "Only patients can enter a therapist code" });
+    }
+    const code = String(req.body?.therapistCode || "").trim().toUpperCase();
+    if (!code) return res.status(400).json({ error: "Please enter a therapist code" });
+
+    const therapist = await prisma.user.findUnique({
+      where: { therapistCode: code },
+      select: { id: true, fullName: true },
+    });
+    if (!therapist) {
+      return res.status(404).json({ error: "That therapist code isn't valid. Please check it with your therapist." });
+    }
+
+    const profile = await prisma.patientProfile.findUnique({ where: { userId: req.user.userId } });
+    if (!profile) return res.status(404).json({ error: "Patient profile not found" });
+
+    const existing = await prisma.patientTherapist.findFirst({
+      where: { patientProfileId: profile.id, therapistId: therapist.id },
+    });
+    if (!existing) {
+      const count = await prisma.patientTherapist.count({ where: { patientProfileId: profile.id } });
+      await prisma.patientTherapist.create({
+        data: { patientProfileId: profile.id, therapistId: therapist.id, isPrimary: count === 0 },
+      });
+    }
+    res.json({ message: `Connected to ${therapist.fullName}`, therapists: await listTherapists(profile.id) });
+  } catch (error) {
+    console.error("❌ Link therapist error:", error);
+    res.status(500).json({ error: "Failed to link therapist" });
+  }
+});
+
+// Patient disconnects from a therapist.
+app.delete("/api/patient/therapists/:therapistId", authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== "PATIENT") return res.status(403).json({ error: "Only patients can do this" });
+    const profile = await prisma.patientProfile.findUnique({ where: { userId: req.user.userId } });
+    if (!profile) return res.status(404).json({ error: "Patient profile not found" });
+    await prisma.patientTherapist.deleteMany({
+      where: { patientProfileId: profile.id, therapistId: req.params.therapistId },
+    });
+    res.json({ message: "Disconnected", therapists: await listTherapists(profile.id) });
+  } catch (error) {
+    console.error("❌ Unlink therapist error:", error);
+    res.status(500).json({ error: "Failed to disconnect" });
+  }
+});
+
+// Caregiver enters a patient's invite code.
+app.post("/api/caregiver/link-patient", authenticateToken, linkRateLimit(15), async (req, res) => {
+  try {
+    if (req.user.role !== "CAREGIVER") {
+      return res.status(403).json({ error: "Only caregivers can link to a patient" });
+    }
+    const code = String(req.body?.inviteCode || "").trim().toUpperCase();
+    if (!code) return res.status(400).json({ error: "Please enter the patient's invite code" });
+
+    const relationship = ["PARENT", "GUARDIAN", "SPOUSE", "OTHER"].includes(req.body?.relationship)
+      ? req.body.relationship
+      : "OTHER";
+
+    const profile = await prisma.patientProfile.findUnique({
+      where: { inviteCode: code },
+      include: { user: { select: { id: true, fullName: true } } },
+    });
+    if (!profile) return res.status(404).json({ error: "That invite code isn't valid. Ask the patient to check their code." });
+
+    const existing = await prisma.patientCaregiver.findFirst({
+      where: { patientProfileId: profile.id, caregiverId: req.user.userId },
+    });
+    if (!existing) {
+      await prisma.patientCaregiver.create({
+        data: { patientProfileId: profile.id, caregiverId: req.user.userId, relationship },
+      });
+    }
+    res.json({ message: `Connected to ${profile.user.fullName}` });
+  } catch (error) {
+    console.error("❌ Link patient error:", error);
+    res.status(500).json({ error: "Failed to link patient" });
+  }
+});
+
+// =========================
+// PATIENTS (only the ones linked to you)
 // =========================
 
 app.get("/api/patients", authenticateToken, async (req, res) => {
   try {
-    if (req.user.role === "PATIENT") {
+    let where;
+    if (req.user.role === "THERAPIST") {
+      where = { role: "PATIENT", patientProfile: { therapists: { some: { therapistId: req.user.userId } } } };
+    } else if (req.user.role === "CAREGIVER") {
+      where = { role: "PATIENT", patientProfile: { caregivers: { some: { caregiverId: req.user.userId } } } };
+    } else {
       return res.status(403).json({ error: "Patients cannot list other patients" });
     }
     const patients = await prisma.user.findMany({
-      where: { role: "PATIENT" },
+      where,
       select: { id: true, email: true, fullName: true, role: true, organizationId: true, createdAt: true },
     });
     res.json(patients);
@@ -622,7 +789,8 @@ app.post("/api/exercise-assignments/:assignmentId/complete", authenticateToken, 
     });
     if (!assignment) return res.status(404).json({ error: "Assignment not found" });
 
-    if (!canAccessPatient(req, assignment.patientProfile.userId)) {
+    // Only the patient themselves can complete their own exercise.
+    if (req.user.role !== "PATIENT" || req.user.userId !== assignment.patientProfile.userId) {
       return res.status(403).json({ error: "You can't complete someone else's exercise" });
     }
 
@@ -1122,6 +1290,9 @@ app.get("/api/patients/:patientId/wellness", authenticateToken, guardPatient, as
 
 app.post("/api/audio/upload", authenticateToken, upload.single("audio"), async (req, res) => {
   try {
+    if (req.user.role !== "PATIENT") {
+      return res.status(403).json({ error: "Only patients can upload recordings" });
+    }
     if (!req.file) return res.status(400).json({ error: "No audio file uploaded" });
 
     const patientProfile = await prisma.patientProfile.findUnique({
@@ -1309,7 +1480,7 @@ app.get("/api/patients/:patientId/dashboard", authenticateToken, guardPatient, a
 });
 
 // =========================
-// THERAPIST DASHBOARD
+// THERAPIST DASHBOARD (only patients linked via this therapist's code)
 // =========================
 
 app.get("/api/therapist/dashboard", authenticateToken, async (req, res) => {
@@ -1319,7 +1490,10 @@ app.get("/api/therapist/dashboard", authenticateToken, async (req, res) => {
     }
 
     const patients = await prisma.user.findMany({
-      where: { role: "PATIENT" },
+      where: {
+        role: "PATIENT",
+        patientProfile: { therapists: { some: { therapistId: req.user.userId } } },
+      },
       select: { id: true, fullName: true, email: true, organizationId: true, createdAt: true },
       orderBy: { fullName: "asc" },
     });
@@ -1390,6 +1564,10 @@ app.get("/api/therapist/patients/:patientId", authenticateToken, async (req, res
 
     const { patientId } = req.params;
 
+    if (!(await canAccessPatient(req, patientId))) {
+      return res.status(403).json({ error: "This patient isn't linked to you" });
+    }
+
     const patient = await prisma.user.findUnique({
       where: { id: patientId },
       select: { id: true, fullName: true, email: true, role: true, organizationId: true, createdAt: true },
@@ -1452,7 +1630,7 @@ app.get("/api/patients/:patientId/feedback", authenticateToken, guardPatient, as
   }
 });
 
-app.post("/api/patients/:patientId/feedback", authenticateToken, async (req, res) => {
+app.post("/api/patients/:patientId/feedback", authenticateToken, guardPatient, async (req, res) => {
   try {
     if (!["CAREGIVER", "THERAPIST"].includes(req.user.role)) {
       return res.status(403).json({ error: "Only caregivers or therapists can submit feedback" });
@@ -1494,6 +1672,23 @@ app.post("/api/patients/:patientId/feedback", authenticateToken, async (req, res
 // START SERVER
 // =========================
 
+// Gives existing therapists / patients a code the first time the new version boots.
+async function backfillCodes() {
+  try {
+    const therapists = await prisma.user.findMany({ where: { role: "THERAPIST", therapistCode: null }, select: { id: true } });
+    for (const t of therapists) {
+      await prisma.user.update({ where: { id: t.id }, data: { therapistCode: await generateUniqueCode("THR") } });
+    }
+    const patients = await prisma.patientProfile.findMany({ where: { inviteCode: null }, select: { id: true } });
+    for (const p of patients) {
+      await prisma.patientProfile.update({ where: { id: p.id }, data: { inviteCode: await generateUniqueCode("PAT") } });
+    }
+  } catch (err) {
+    console.warn("⚠️ Code backfill skipped:", err.message);
+  }
+}
+
 app.listen(PORT, () => {
   console.log(`🚀 Swar Saathi backend running on port ${PORT}`);
+  backfillCodes();
 });

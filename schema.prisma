@@ -48,6 +48,8 @@ model User {
   fullName           String
   passwordHash       String
   role               Role
+  // NEW: only set for THERAPIST users. Patients enter this code to link to the therapist.
+  therapistCode      String?              @unique
   patientProfile     PatientProfile?
   therapistPatients  PatientTherapist[]
   caregiverPatients  PatientCaregiver[]
@@ -67,6 +69,8 @@ model PatientProfile {
   primaryDiagnosis       String
   clinicalNotes          String
   currentDifficultyLevel Int                  @default(1)
+  // NEW: patients share this with caregivers so a caregiver can see only that patient.
+  inviteCode             String?              @unique
   // --- Gamification / engagement tracking ---
   totalPoints            Int                  @default(0)
   currentStreak          Int                  @default(0)
@@ -87,6 +91,8 @@ model PatientTherapist {
   therapistId      String
   therapist        User           @relation(fields: [therapistId], references: [id])
   isPrimary        Boolean        @default(true)
+
+  @@unique([patientProfileId, therapistId])
 }
 
 model PatientCaregiver {
@@ -95,7 +101,9 @@ model PatientCaregiver {
   patientProfile   PatientProfile        @relation(fields: [patientProfileId], references: [id])
   caregiverId      String
   caregiver        User                  @relation(fields: [caregiverId], references: [id])
-  relationship     CaregiverRelationship
+  relationship     CaregiverRelationship @default(OTHER)
+
+  @@unique([patientProfileId, caregiverId])
 }
 
 model Exercise {
@@ -161,7 +169,7 @@ model CaregiverFeedback {
   createdAt        DateTime       @default(now())
 }
 
-// NEW: daily wellness check-in (voice-health context for the AI)
+// Daily wellness check-in (voice-health context for the AI)
 model WellnessCheckIn {
   id               String         @id @default(uuid())
   patientProfileId String
